@@ -1,6 +1,8 @@
 import click
 
-from commands.eda import eda as eda_group  # <-- import the real EDA group
+from commands.eda import eda as eda_group 
+from commands.preprocess import preprocess as preprocess_group
+from commands.embed import embed as embed_group
 
 
 @click.group()
@@ -8,21 +10,12 @@ def cli():
     """Arabic NLP Classification CLI Tool"""
     pass
 
-
 # Register groups from commands/*
 cli.add_command(eda_group, name="eda")
 
+cli.add_command(preprocess_group, name="preprocess")
 
-@cli.group()
-def preprocess():
-    """Text preprocessing commands"""
-    pass
-
-
-@cli.group()
-def embed():
-    """Text embedding commands"""
-    pass
+cli.add_command(embed_group, name="embed")
 
 
 @cli.command()

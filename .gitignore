@@ -29,8 +29,8 @@ Thumbs.db
 # ==============================
 # Data
 # ==============================
-data/arabic_dataset_classifiction.csv
-
+data/
+embeddings/
 # ==============================
 # Caches / Temp
 # ==============================
