@@ -1,0 +1,39 @@
+{
+  "csv_path": "data/arabic_dataset_classifiction.csv",
+  "rows": 111726,
+  "columns": [
+    "text",
+    "target"
+  ],
+  "missing_values": {
+    "text": 2939,
+    "target": 0
+  },
+  "text_stats": {
+    "chars": {
+      "mean": 1512.8833574995972,
+      "min": 2,
+      "max": 28083
+    },
+    "words": {
+      "mean": 254.51829475681578,
+      "min": 1,
+      "max": 5049
+    }
+  },
+  "label_col": "target",
+  "label_distribution_raw": {
+    "0": 13736,
+    "1": 16728,
+    "2": 14235,
+    "3": 20505,
+    "4": 46522
+  },
+  "label_distribution_named": {
+    "0 (Culture)": 13736,
+    "1 (Diverse)": 16728,
+    "2 (Economy)": 14235,
+    "3 (Politic)": 20505,
+    "4 (Sport)": 46522
+  }
+}
