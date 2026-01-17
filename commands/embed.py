@@ -18,8 +18,11 @@ from utils.data_handler import load_csv, ensure_column_exists
 
 def _ensure_out(path: str) -> Path:
     p = Path(path)
+    if p.parent == Path("."):
+        p = Path("outputs/embeddings") / p.name
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
 
 
 def _drop_empty(df: pd.DataFrame, text_col: str) -> pd.DataFrame:
