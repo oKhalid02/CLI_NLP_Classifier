@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional
 import click
 import numpy as np
 import pandas as pd
-from joblib import dump
+import joblib
+
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
@@ -42,14 +43,14 @@ def _ensure_dir(path: str) -> Path:
 
 
 # -------------------------
-# Model + parsing helpers
+# Parsing + model helpers
 # -------------------------
 def _is_embeddings_file(s: str) -> bool:
-    """Treat input_col as embeddings file if it exists OR looks like a pkl/joblib path."""
+    """Treat input_col as embeddings file if it exists OR looks like an embeddings file path."""
     p = Path(s)
     if p.exists() and p.is_file():
         return True
-    return p.suffix.lower() in {".pkl", ".pickle", ".joblib"}
+    return p.suffix.lower() in {".pkl", ".pickle", ".joblib", ".npy", ".npz"}
 
 
 def _parse_hparams(spec: str) -> tuple[str, Dict[str, Any]]:
@@ -92,7 +93,7 @@ def _expand_models(models: List[str]) -> List[str]:
     """
     Teacher inputs:
       - [] -> default knn/lr/rf
-      - ["all"] -> a bigger set
+      - ["all"] -> bigger set
       - ["knn", "lr", "rf"] -> as-is
       - ["knn:n_neighbors=7", "lr:C=0.5"] -> as-is
     """
@@ -100,7 +101,7 @@ def _expand_models(models: List[str]) -> List[str]:
         return ["knn", "lr", "rf"]
 
     if len(models) == 1 and models[0].lower() == "all":
-        # IMPORTANT: NB is count-based; embeddings can be negative. We'll skip NB later if invalid.
+        # NOTE: "nb" is MultinomialNB (good for TF-IDF/counts). We'll auto-skip it if features contain negatives.
         return ["knn", "lr", "rf", "svm", "nb", "dt"]
 
     return models
@@ -146,27 +147,55 @@ def _make_model(name: str, params: Dict[str, Any]):
 
 
 # -------------------------
-# Embedding loaders
+# Embeddings loaders (robust)
 # -------------------------
-def _load_embeddings_from_pkl(path: str) -> np.ndarray:
+def _load_embeddings_any(path: str):
     """
-    Supports:
-      - dict with {"vectors": np.ndarray}
-      - raw np.ndarray
+    Robust loader for embeddings saved by different methods:
+      - joblib (.pkl/.joblib)  [recommended for sklearn sparse objects]
+      - pickle (.pkl/.pickle)
+      - numpy (.npy/.npz)
+      - dict payloads: {"vectors": X}
+    Returns: X (numpy array OR scipy sparse matrix)
     """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Embeddings file not found: {path}")
 
-    with open(p, "rb") as f:
-        obj = pickle.load(f)
+    suffix = p.suffix.lower()
 
-    vecs = obj["vectors"] if isinstance(obj, dict) and "vectors" in obj else obj
-    X = np.asarray(vecs)
+    # Numpy formats
+    if suffix == ".npy":
+        return np.load(p, allow_pickle=False)
 
-    if X.ndim != 2:
-        raise ValueError(f"Embeddings must be 2D (n_samples, dim). Got shape {X.shape}")
-    return X
+    if suffix == ".npz":
+        # could be scipy sparse saved with sparse.save_npz
+        try:
+            from scipy import sparse  # type: ignore
+            return sparse.load_npz(p)
+        except Exception:
+            z = np.load(p, allow_pickle=True)
+            for k in ("vectors", "X", "arr_0"):
+                if k in z:
+                    return z[k]
+            raise ValueError(f"Could not find vectors in npz file: {path}")
+
+    # Try joblib first (best for sparse matrices)
+    obj = None
+    try:
+        obj = joblib.load(p)
+    except Exception:
+        obj = None
+
+    # Fallback to pickle
+    if obj is None:
+        with open(p, "rb") as f:
+            obj = pickle.load(f)
+
+    if isinstance(obj, dict) and "vectors" in obj:
+        obj = obj["vectors"]
+
+    return obj
 
 
 def _load_embeddings_from_column(df: pd.DataFrame, col: str) -> np.ndarray:
@@ -204,8 +233,7 @@ def _load_embeddings_from_column(df: pd.DataFrame, col: str) -> np.ndarray:
     max_len = max((len(r) for r in rows), default=0)
     if max_len == 0:
         raise click.UsageError(
-            f"Could not parse embeddings from column '{col}'. "
-            "Expected values like [0.1, 0.2, ...]."
+            f"Could not parse embeddings from column '{col}'. Expected values like [0.1, 0.2, ...]."
         )
 
     clean = []
@@ -223,8 +251,49 @@ def _load_embeddings_from_column(df: pd.DataFrame, col: str) -> np.ndarray:
     return np.asarray(clean, dtype=np.float32)
 
 
+def _row_nonzero_mask(X) -> np.ndarray:
+    """
+    Returns boolean mask for rows with non-zero content.
+    Works for numpy arrays and scipy sparse matrices.
+    """
+    # numpy arrays
+    try:
+        row_sum = np.asarray(np.abs(X).sum(axis=1)).reshape(-1)
+        return row_sum > 0
+    except Exception:
+        pass
+
+    # scipy sparse
+    try:
+        row_sum = np.asarray(X.multiply(X).sum(axis=1)).reshape(-1)
+        return row_sum > 0
+    except Exception as e:
+        raise ValueError(f"Could not compute non-zero row mask for embeddings: {e}")
+
+
+def _has_negative_values(X) -> bool:
+    """
+    Detect if X has negative values.
+    Works for numpy arrays and scipy sparse matrices.
+    """
+    # numpy arrays
+    try:
+        return bool(np.min(X) < 0)
+    except Exception:
+        pass
+
+    # scipy sparse: if it has any negative data values
+    try:
+        data = getattr(X, "data", None)
+        if data is None:
+            return False
+        return bool(np.min(data) < 0)
+    except Exception:
+        return False
+
+
 # -------------------------
-# Plots (only confusion matrix + ROC bonus)
+# Plots (NO feature importance)
 # -------------------------
 def _save_confusion_matrix_plot(cm: np.ndarray, class_names: List[str], out_path: Path, title: str):
     import matplotlib.pyplot as plt
@@ -298,7 +367,7 @@ def _try_save_roc_plot(model, X_test, y_test, out_path: Path, title: str) -> Opt
     "--input_col",
     required=True,
     type=str,
-    help="Either embeddings file path (outputs/embeddings/*.pkl) OR embedding column name in CSV",
+    help="Either embeddings file path (outputs/embeddings/*) OR embedding column name in CSV",
 )
 @click.option("--output_col", required=True, type=str, help="Label column in CSV (target y)")
 @click.option("--test_size", default=0.2, show_default=True, type=float, help="Test split ratio")
@@ -324,16 +393,15 @@ def train(
 ):
     """
     Works with teacher commands like:
-      python main.py train --csv_path final.csv --input_col outputs/embeddings/embeded_vec.pkl --output_col class --models knn lr rf
-      python main.py train --csv_path final.csv --input_col outputs/embeddings/embeded_vec.pkl --output_col class --models all
-      python main.py train --csv_path final.csv --input_col outputs/embeddings/embeded_vec.pkl --output_col class --models "knn:n_neighbors=7" "lr:C=0.5"
+      python main.py train --csv_path final.csv --input_col outputs/embeddings/tfidf_vectors.pkl --output_col class --models knn lr rf
+      python main.py train --csv_path final.csv --input_col outputs/embeddings/tfidf_vectors.pkl --output_col class --models all
+      python main.py train --csv_path final.csv --input_col outputs/embeddings/tfidf_vectors.pkl --output_col class --models "knn:n_neighbors=7" "lr:C=0.5"
     """
 
     # -------- Parse models in teacher style --------
     extra_tokens = list(ctx.args)  # tokens after known options
-    model_tokens: List[str]
     if models is None:
-        model_tokens = []
+        model_tokens: List[str] = []
     else:
         model_tokens = [models] + extra_tokens
 
@@ -350,14 +418,14 @@ def train(
     log(f"Loaded CSV rows={len(df)} cols={list(df.columns)}")
     ensure_column_exists(df, output_col)
 
-    # -------- Load embeddings --------
+    # -------- Load embeddings (file or column) --------
     if _is_embeddings_file(input_col):
         log(f"Loading embeddings from file: {input_col}")
-        X = _load_embeddings_from_pkl(input_col)
+        X = _load_embeddings_any(input_col)
         log(f"Embeddings shape: {X.shape}")
-        if len(X) != len(df):
+        if X.shape[0] != len(df):
             raise click.UsageError(
-                f"Embeddings rows ({len(X)}) != CSV rows ({len(df)}). "
+                f"Embeddings rows ({X.shape[0]}) != CSV rows ({len(df)}). "
                 "Make sure embeddings were created from the SAME CSV (same order)."
             )
         embeddings_source = f"file:{input_col}"
@@ -371,7 +439,9 @@ def train(
     # -------- Clean rows: drop missing labels + zero vectors --------
     y_raw = df[output_col]
     keep = ~pd.isna(y_raw)
-    keep = keep & (np.abs(X).sum(axis=1) > 0)
+
+    nonzero_mask = _row_nonzero_mask(X)
+    keep = keep & nonzero_mask
 
     dropped = int((~keep).sum())
     if dropped:
@@ -395,6 +465,9 @@ def train(
         X2, y_enc, test_size=test_size, random_state=seed, stratify=y_enc
     )
     log(f"Split: train={len(y_train)} test={len(y_test)} (test_size={test_size})")
+
+    # Skip MultinomialNB when features contain negatives (embeddings)
+    has_negative = _has_negative_values(X_train)
 
     # -------- Output dirs --------
     ts = _timestamp()
@@ -424,16 +497,13 @@ def train(
     per_model: List[Dict[str, Any]] = []
     best: Optional[Dict[str, Any]] = None
 
-    # Pre-check for NB validity (MultinomialNB requires non-negative values)
-    has_negative = bool(np.min(X_train) < 0)
-
     for spec in model_list:
         name, params = _parse_hparams(spec)
         log(f"Training model: {spec} (parsed name={name}, params={params})")
 
-        # Skip MultinomialNB when embeddings contain negatives
+        # Skip MultinomialNB if negative values exist (won't work on embeddings)
         if name == "nb" and has_negative:
-            log("Skipping nb: MultinomialNB requires non-negative features, but embeddings contain negatives.")
+            log("Skipping nb: MultinomialNB requires non-negative features, but features contain negatives.")
             continue
 
         clf = _make_model(name, params)
@@ -457,7 +527,9 @@ def train(
         log(f"Saved confusion matrix: {cm_plot_path}")
 
         roc_auc = _try_save_roc_plot(
-            clf, X_test, y_test,
+            clf,
+            X_test,
+            y_test,
             out_path=(viz_dir / f"roc_{name}_{ts}.png"),
             title=f"ROC Curve: {spec}",
         )
@@ -470,16 +542,18 @@ def train(
             f"{(f'{roc_auc:.4f}' if roc_auc is not None else 'N/A')} |"
         )
 
-        per_model.append({
-            "spec": spec,
-            "cm_plot": str(cm_plot_path),
-            "roc_auc": roc_auc,
-            "roc_plot": str(roc_plot_path) if roc_plot_path else None,
-            "accuracy": acc,
-            "precision_macro": prec,
-            "recall_macro": rec,
-            "f1_macro": f1,
-        })
+        per_model.append(
+            {
+                "spec": spec,
+                "cm_plot": str(cm_plot_path),
+                "roc_auc": roc_auc,
+                "roc_plot": str(roc_plot_path) if roc_plot_path else None,
+                "accuracy": acc,
+                "precision_macro": prec,
+                "recall_macro": rec,
+                "f1_macro": f1,
+            }
+        )
 
         if best is None or f1 > best["f1_macro"]:
             best = {
@@ -496,7 +570,7 @@ def train(
     if not per_model or best is None:
         raise click.UsageError("No models were successfully trained. Check logs above.")
 
-    # -------- Confusion matrices section (FIXED image paths) --------
+    # -------- Confusion matrices section (correct MD paths) --------
     md.append("\n## Confusion Matrices (per model)\n")
     for row in per_model:
         md.append(f"### `{row['spec']}`\n")
@@ -520,7 +594,7 @@ def train(
 
     # -------- Save best model --------
     if save_model:
-        model_path = Path('outputs/models/' + save_model)
+        model_path = Path(save_model)
     else:
         model_path = models_dir / f"best_model_{ts}.pkl"
     _ensure_dir(str(model_path.parent))
