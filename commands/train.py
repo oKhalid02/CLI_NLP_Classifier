@@ -611,7 +611,7 @@ def train(
         "seed": seed,
         "trained_at": ts,
     }
-    dump(payload, model_path)
+    joblib.dump(payload, model_path)
     log(f"Saved best model: {model_path}")
 
     md.append(f"- Saved model: `{model_path}`\n")
